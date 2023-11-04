@@ -1,6 +1,6 @@
 ;;; srht-git.el --- Sourcehut git                    -*- lexical-binding: t; -*-
 
-;; Copyright © 2022  Free Software Foundation, Inc.
+;; Copyright © 2022-2023  Free Software Foundation, Inc.
 
 ;; Created: <2022-04-26 Tue>
 
@@ -185,8 +185,9 @@ is assumed."
 
 (defun srht-git--annot (domain str)
   "Function to add annotations in the completions buffer for STR and DOMAIN."
-  (srht-annotation (seq _n created visibility)
-    (srht-git--candidates domain) str))
+  (pcase-let (((seq _n created visibility)
+               (assoc str (srht-git--candidates domain))))
+    (srht-annotation str visibility created)))
 
 (defun srht-git--repo-name-read (domain)
   "Read a repository name in the minibuffer, with completion.
@@ -198,26 +199,6 @@ DOMAIN is the domain name of the Sourcehut instance."
 
 (defvar srht-git-repo-name-history nil
   "History variable.")
-
-(defun srht-git--else (domain plz-error)
-  "An optional callback function.
-Called when the request fails with two arguments, a ‘plz-error’ struct PLZ-ERROR
-and domain name DOMAIN."
-  (pcase-let* (((cl-struct plz-error response) plz-error)
-               ((cl-struct plz-response status body) response))
-    (pcase status
-      (201 (srht-with-json-read-from-string body
-             (map (:name repo-name)
-                  (:owner (map (:canonical_name username))))
-             (srht-kill-link domain 'git username repo-name)
-             (srht-retrive (srht-git-repos domain)
-                           :then (lambda (resp)
-                                   (srht-put srht-git-repos domain resp)))))
-      (204 (srht-retrive (srht-git-repos domain)
-                         :then (lambda (resp)
-                                 (srht-put srht-git-repos domain resp)
-                                 (message "Deleted!"))))
-      (_ (error "Unkown error with status %s: %S" status plz-error)))))
 
 ;;;###autoload
 (defun srht-git-repo-create (domain visibility name description)
@@ -233,8 +214,18 @@ Set VISIBILITY and DESCRIPTION."
                               :visibility visibility
                               :name name
                               :description description)
-               :then (lambda (_r))
-               :else (lambda (err) (srht-git--else domain err))))
+               :then (lambda (results)
+                       (pcase-let* (((map (:name repo-name)
+                                          (:owner (map (:canonical_name username))))
+                                     results)
+                                    (url (srht--make-uri
+                                          domain 'git
+                                          (format "/%s/%s" username repo-name) nil)))
+                         (srht-copy-url url)
+                         (srht-browse-url url)
+                         (srht-retrive (srht-git-repos domain)
+                                       :then (lambda (resp)
+                                               (srht-put srht-git-repos domain resp)))))))
 
 (defun srht-git--find-info (domain repo-name)
   "Find repository information by REPO-NAME from the DOMAIN instance."
@@ -264,7 +255,6 @@ Set VISIBILITY, NEW-NAME and DESCRIPTION."
                                 :visibility visibility
                                 :name new-name
                                 :description description)
-                 :else (lambda (err) (srht-git--else domain err))
                  :then (lambda (_resp)
                          ;; NOTE: resp examle
                          ;; (:id 110277
@@ -288,9 +278,16 @@ Set VISIBILITY, NEW-NAME and DESCRIPTION."
      (list instance (srht-git--repo-name-read instance))))
   (when (yes-or-no-p
          (format "This action cannot be undone.\n Delete %s repository?" repo-name))
-    (srht-delete (srht-git-repo domain repo-name)
-                 :then (lambda (_r))
-                 :else (lambda (err) (srht-git--else domain err)))))
+    (srht-delete
+     (srht-git-repo domain repo-name)
+     :as 'string
+     :then (lambda (_r)
+             (srht-retrive
+              (srht-git-repos domain)
+              :then (lambda (resp)
+                      (srht-put srht-git-repos domain resp)
+                      (message (format "Sourcehut %s git repository deleted!" repo-name)
+                               )))))))
 
 (provide 'srht-git)
 ;;; srht-git.el ends here

@@ -1,6 +1,6 @@
 ;;; srht-paste.el --- Sourcehut paste                -*- lexical-binding: t; -*-
 
-;; Copyright © 2022  Free Software Foundation, Inc.
+;; Copyright © 2022-2023  Free Software Foundation, Inc.
 
 ;; This file is part of GNU Emacs.
 
@@ -73,8 +73,9 @@ For the existing PASTES for the DOMAIN domain name."
 
 (defun srht-paste--annot (domain str)
   "Function to add annotations in the completions buffer for STR and DOMAIN."
-  (srht-annotation (seq _f created visibility)
-    (srht-paste--candidates domain) str))
+  (pcase-let (((seq _f created visibility)
+               (assoc str (srht-paste--candidates domain))))
+    (srht-annotation str visibility created)))
 
 (defun srht-paste--sha (domain)
   "Read a FILENAME in the minibuffer, with completion and return SHA.
@@ -109,26 +110,6 @@ the whole buffer."
       (buffer-substring-no-properties (region-beginning) (region-end))
     (buffer-string)))
 
-(defun srht-paste--else (domain plz-error)
-  "An optional callback function.
-Called when the request fails with one argument, a ‘plz-error’ struct PLZ-ERROR
-and domain name DOMAIN."
-  (pcase-let* (((cl-struct plz-error response) plz-error)
-               ((cl-struct plz-response status body) response))
-    (pcase status
-      (201 (srht-with-json-read-from-string body
-             (map (:sha sha)
-                  (:user (map (:canonical_name name))))
-             (srht-kill-link domain 'paste name sha)
-             (srht-retrive (srht-pastes domain)
-                           :then (lambda (resp)
-                                   (srht-put srht-paste-all-pastes domain resp)))))
-      (204 (srht-retrive (srht-pastes domain)
-                         :then (lambda (resp)
-                                 (srht-put srht-paste-all-pastes domain resp)
-                                 (message "Deleted!"))))
-      (_ (error "Unkown error with status %s: %S" status plz-error)))))
-
 ;;;###autoload
 (defun srht-paste-region (domain visibility filename)
   "Paste region or buffer to Sourcehut instance with DOMAIN.
@@ -144,8 +125,18 @@ Set FILENAME and VISIBILITY."
                  :visibility visibility
                  :filename filename
                  :contents content)
-     :then (lambda (_r))
-     :else (lambda (err) (srht-paste--else domain err)))))
+     :then
+     (lambda (results)
+       (pcase-let* (((map (:sha sha)
+                          (:user (map (:canonical_name username))))
+                     results)
+                    (url (srht--make-uri
+                          domain 'paste (format "/%s/%s" username sha) nil)))
+         (srht-copy-url url)
+         (srht-browse-url url)
+         (srht-retrive (srht-pastes domain)
+                       :then (lambda (resp)
+                               (srht-put srht-paste-all-pastes domain resp))))))))
 
 ;;;###autoload
 (defun srht-paste-delete (domain sha)
@@ -153,18 +144,30 @@ Set FILENAME and VISIBILITY."
   (interactive
    (let ((instance (srht-read-domain "Instance: ")))
      (list instance (srht-paste--sha instance))))
-  (srht-delete (srht-paste domain sha)
-               :then (lambda (_r))
-               :else (lambda (err) (srht-paste--else domain err))))
+  (srht-delete
+   (srht-paste domain sha)
+   :as 'string
+   :then (lambda (_r)
+           (srht-retrive
+            (srht-pastes domain)
+            :then (lambda (resp)
+                    (srht-put srht-paste-all-pastes domain resp)
+                    (message "Deleted!"))))))
 
 ;;;###autoload
-(defun srht-paste-link (domain)
-  "Kill the link of the selected paste owned by the USER from the DOMAIN instance."
+(defun srht-paste-copy-url (domain)
+  "Copy selected paste URL to clipboard.
+DOMAIN (see `srht-read-domain')."
   (interactive (list (srht-read-domain "Instance: ")))
   (when (string-empty-p srht-username)
     (error "`srht-username' must be set"))
-  (srht-kill-link domain 'paste (concat "~" (string-trim-left srht-username "~"))
-                  (srht-paste--sha domain)))
+  (let* ((sha (srht-paste--sha domain))
+         (username (concat "~" (string-trim-left srht-username "~")))
+         (url (srht--make-uri
+               domain 'paste (format "/%s/%s" username sha) nil)))
+    (srht-copy-url url)
+    (srht-browse-url url)))
+
 
 (provide 'srht-paste)
 ;;; srht-paste.el ends here
