@@ -37,23 +37,33 @@
 If you pass this value into repositories(cursor:\"...\") in a
 subsequent request, you'll get the next page.")
 
-(defconst srht-git-gql-base-query
-  '(:query me
-    :fields
-    (canonicalName
-     (:type repositories
+(defun srht-git-repositories-next (cursor)
+  "Next query from CURSOR."
+  (let ((repositories `(:type repositories
+                        :arguments (:filter (:count 30) :cursor ,cursor)
+                        :fields
+                        (cursor
+                         (:type results
+                          :fields (id
+                                   name
+                                   description
+                                   created
+                                   updated
+                                   visibility))))))
+    `(:query me
       :fields
-      (cursor
-       (:type results
-        :fields(id name description created updated visibility)))))))
+      (canonicalName ,repositories))))
 
-(defun srht-git--gql-next-query (cursor)
-  "Created next query from CURSOR."
-  (pcase-let* ((plist (seq-copy srht-git-gql-base-query))
-               ((map (:fields (seq n lst))) plist))
-    (plist-put
-     plist
-     :fields `(,n ,(plist-put lst :arguments `(:cursor ,cursor))))))
+(cl-defun srht-git-request (instance query &optional (then 'sync))
+  "Request git.INSTANCE.
+QUERY is GraphQL.  THEN (see `plz')."
+  (declare (indent 1))
+  (srht--gql-api-request
+   :instance instance
+   :service 'git
+   :token-host "git.sr.ht"
+   :then then
+   :query query))
 
 (defun srht-git-repos (instance)
   "Retrive list of repositories from INSTANCE.
@@ -61,20 +71,15 @@ CALLBACK is called when the object has been completely retrieved.
 Or CALLBACK may be `sync' to make a synchronous request."
   (declare (indent 1))
   (named-let loop ((query (srht-gql-query
-                           (srht-git--gql-next-query nil)))
+                           (srht-git-repositories-next nil)))
                    (cursor "") (ac nil))
     (if cursor
-        (pcase-let (((map (:data
-                           (map (:me
-                                 (map (:repositories
-                                       (map (:cursor pointer)
-                                            (:results results))))))))
-                     (srht--gql-api-request
-                      :instance instance
-                      :service 'git
-                      :token-host "git.sr.ht"
-                      :query query)))
-          (loop (srht-gql-query (srht-git--gql-next-query pointer))
+        (let* ((resp (srht-git-request instance query))
+               (results (srht-plist-get resp
+                          :data :me :repositories :results))
+               (pointer (srht-plist-get resp
+                          :data :me :repositories :cursor)))
+          (loop (srht-gql-query (srht-git-repositories-next pointer))
                 pointer (append results ac)))
       ac)))
 
@@ -127,29 +132,50 @@ INITIAL-INPUT, HISTORY (see `read-from-minibuffer')."
         (message "Please enter non-empty!")
         (sit-for 1)))))
 
+(defun srht-git--read-url (prompt initial-input history)
+  "Read URL string from the minibuffer, prompting with string PROMPT.
+INITIAL-INPUT, HISTORY (see `read-from-minibuffer')."
+  (save-match-data
+    (cl-block nil
+      (while t
+        (let ((str (read-from-minibuffer prompt initial-input nil nil history))
+              (regex (rx (group "http"
+                                (zero-or-one "s")
+                                "://")
+                         (group (* alphanumeric)))))
+          (when (eq 0 (string-match regex str))
+            (cl-return str)))
+        (message "Please enter url with https://")
+        (sit-for 1)))))
+
 ;;;###autoload (autoload 'srht-git-repo-create "srht-git" nil t)
 (transient-define-prefix srht-git-repo-create ()
   "Prefix that just shows off many typical infix types."
   ["Repo input"
    ("i" "instance" "instance="
     :always-read t
-    :init-value (lambda (obj) (oset obj value (seq-first srht-instances))))
+    :init-value (lambda (obj) (oset obj value (seq-first srht-instances)))
+    :prompt "Instance: "
+    :reader (lambda (prompt _initial-input _history)
+              (srht-read-instance prompt)))
    ("n" "name" "name="
     :always-read t
     :prompt "Git repository name: "
     :reader srht-git--read-non-empty)
    ("v" "visibility" "visibility="
-    :choices (public unlisted private)
     :always-read t
-    :allow-empty nil)
+    :allow-empty nil
+    :prompt "Visibility: "
+    :reader (lambda (prompt _initial-input _history)
+              (srht-read-visibility prompt)))
    ("d" "description" "description="
     :always-read t
     :prompt "Repository description (markdown): ")
    ("u" "clone URL" "cloneUrl="
     :always-read t
     :prompt "Repository will be cloned from the given URL: "
-    ;; TODO: add custom reader
-    )]
+    :reader srht-git--read-url)
+   ]
   ["New repository"
    ("c" "create repository" srht-git-repo-create0)])
 
@@ -160,7 +186,7 @@ INITIAL-INPUT, HISTORY (see `read-from-minibuffer')."
 (transient-define-suffix srht-git-repo-create0 ()
   "Create the NAME repository on an instance with the instance name INSTANCE.
 Set VISIBILITY and DESCRIPTION."
-  (interactive)
+  (interactive nil nil)
   (let ((instance (srht-git--transient-value "instance="))
         (name (let ((val (srht-git--transient-value "name=")))
                 (if (or (null val) (string-empty-p val))
@@ -172,28 +198,25 @@ Set VISIBILITY and DESCRIPTION."
                         (intern (upcase val)))))
         (description (srht-git--transient-value "description="))
         (cloneurl (srht-git--transient-value "cloneUrl=")))
-    (srht--gql-api-request
-     :instance instance
-     :service 'git
-     :token-host "git.sr.ht"
-     :query (srht-gql-mutation
-             `(:query createRepository
-               :arguments (:name ,name
-                           :visibility ,visibility
-                           :description ,description
-                           :cloneurl ,cloneurl)
-               :fields (id)))
-     :then (lambda (_r)
-             (let* ((username (string-trim-left srht-username "~"))
-                    (url (srht--make-uri
-                          instance 'git
-                          (format "/~%s/%s" username name) nil)))
-               (srht-copy-url url)
-               (srht-browse-url url)
-               (srht-put srht-git-repositories
-                 instance (srht-git-repos instance)))
-             (srht-git--message instance
-               "Sourcehut %s git repository created" name)))))
+    (srht-git-request instance
+      (srht-gql-mutation
+       `(:query createRepository
+         :arguments (:name ,name
+                     :visibility ,visibility
+                     :description ,description
+                     :cloneUrl ,cloneurl)
+         :fields (id)))
+      (lambda (_r)
+        (let* ((username (string-trim-left srht-username "~"))
+               (url (srht--make-uri
+                     instance 'git
+                     (format "/~%s/%s" username name) nil)))
+          (srht-copy-url url)
+          (srht-browse-url url)
+          (srht-put srht-git-repositories
+            instance (srht-git-repos instance)))
+        (srht-git--message instance
+          "Sourcehut %s git repository created" name)))))
 
 (defun srht-git--find-repo (instance repo-name)
   "Find repository information by REPO-NAME from the INSTANCE instance."
@@ -214,35 +237,35 @@ the :input argument when making changes to the repository."
       :description ,description
       ,@name-plist)))
 
+(defun srht-git--repoinput-read ()
+  "Read a strings from the minibuffer."
+  (list (read-string "Repository new name (omit to leave them unchanged): "
+                     nil 'srht-git-repo-name-history)
+        (srht-read-visibility "Visibility: ")
+        (read-string "Repository description (markdown): ")))
+
 ;;;###autoload
-(defun srht-git-repo-update (instance repo-name new-name visibility description)
+(defun srht-git-repo-update (instance repo-name)
   "Update the REPO-NAME repository from the INSTANCE instance.
 Set VISIBILITY, NEW-NAME and DESCRIPTION."
   (interactive
-   (let* ((inst (srht-read-instance "Instance: "))
-          (name (srht-git--select-repo inst)))
-     (list inst
-           name
-           (read-string "Repository new name: " nil
-                        'srht-git-repo-name-history)
-           (srht-read-visibility "Visibility: ")
-           (read-string "Repository description (markdown): "))))
-  (when (yes-or-no-p (format "Update %s repository?" repo-name))
-    (let* ((repo (srht-git--find-repo instance repo-name))
-           (id (plist-get repo :id))
-           (repoinput (srht-git--repoinput
-                        repo-name new-name visibility description)))
-      (srht--gql-api-request
-       :instance instance
-       :service 'git
-       :token-host "git.sr.ht"
-       :query (srht-gql-mutation
-               `(:query updateRepository
-                 :arguments (:id ,id :input ,repoinput)
-                 :fields (id)))
-       :then (lambda (_r)
-               (srht-git--message instance
-                 "Sourcehut %s git repository updated!" new-name))))))
+   (let ((inst (srht-read-instance "Instance: ")))
+     (list inst (srht-git--select-repo inst))))
+  (pcase-let* ((repo (srht-git--find-repo instance repo-name))
+               (id (plist-get repo :id))
+               ((seq new-name visibility description)
+                (srht-git--repoinput-read))
+               (repoinput (srht-git--repoinput
+                            repo-name new-name visibility description)))
+    (when (yes-or-no-p (format "Update %s repository?" repo-name))
+      (srht-git-request instance
+        (srht-gql-mutation
+         `(:query updateRepository
+           :arguments (:id ,id :input ,repoinput)
+           :fields (id)))
+        (lambda (_r)
+          (srht-git--message instance
+            "Sourcehut %s git repository updated!" new-name))))))
 
 ;;;###autoload
 (defun srht-git-repo-delete (instance repo-name)
@@ -255,17 +278,44 @@ Set VISIBILITY, NEW-NAME and DESCRIPTION."
                  repo-name))
     (let ((id (plist-get
                (srht-git--find-repo instance repo-name) :id)))
-      (srht--gql-api-request
-       :instance instance
-       :service 'git
-       :token-host "git.sr.ht"
-       :query (srht-gql-mutation
-               `(:query deleteRepository
-                 :arguments (:id ,id)
-                 :fields (id)))
-       :then (lambda (_r)
-               (srht-git--message instance
-                 "Sourcehut %s git repository deleted!" repo-name))))))
+      (srht-git-request instance
+        (srht-gql-mutation
+         `(:query deleteRepository
+           :arguments (:id ,id)
+           :fields (id)))
+        (lambda (_r)
+          (srht-git--message instance
+            "Sourcehut %s git repository deleted!" repo-name))))))
+
+(defun srht-git-repository-log (instance repo-name &optional cursor)
+  "Sourcehut INSTANCE repository REPO-NAME log.
+If you pass value of CURSOR into repositories(cursor:\"...\") in a
+subsequent request, you'll get the next page."
+  (let* ((log `(:type log
+                :arguments (:cursor ,cursor)
+                :fields (cursor
+                         (:type results
+                          :fields (shortId
+                                   message
+                                   (:type author
+                                    :fields (name email)))))))
+         (repository `(:type repository
+                       :arguments (:name ,repo-name)
+                       :fields (id name ,log)
+                       )))
+    (srht-git-request instance
+      (srht-gql-query
+       `(:query me
+         :fields (,repository))))))
+
+;;;###autoload
+(defun srht-git-log (instance repo-name)
+  "Display log of Sourcehut INSTANCE git repositories REPO-NAME."
+  (interactive nil nil)
+  (if-let ((resp (srht-git-repository-log instance repo-name))
+           (log (srht-plist-get resp :data :me :repository :log :results)))
+      (srht--view-log log)
+    (user-error "No log")))
 
 ;;;###autoload
 (defun srht-git-repos-list (instance)
@@ -276,7 +326,12 @@ Set VISIBILITY, NEW-NAME and DESCRIPTION."
     (error "Vtable required"))
   (srht--view instance srht-git-repositories
     `("d" (lambda (obj)
-            (srht-git-repo-delete ,instance (plist-get obj :name))))))
+            (srht-git-repo-delete ,instance (plist-get obj :name)))
+      "u" (lambda (obj)
+            (srht-git-repo-update ,instance (plist-get obj :name)))
+      "c" (lambda (_obj) (srht-git-repo-create))
+      "l" (lambda (obj)
+            (srht-git-log ,instance (plist-get obj :name))))))
 
 ;;;;;;;;;;;;;;;;;;;LEGACY API;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
